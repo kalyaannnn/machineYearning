@@ -10,6 +10,7 @@ Run in Colab:
 
 import math
 import os
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -55,13 +56,13 @@ def load_tokenizer(repo_id: str) -> PreTrainedTokenizerFast:
         "special_tokens_map.json",
     ]
     for filename in filenames:
-        hf_hub_download(
+        downloaded_path = hf_hub_download(
             repo_id=repo_id,
             repo_type="dataset",
             filename=f"tokenizer/{filename}",
-            local_dir=TOKENIZER_DIR,
-            local_dir_use_symlinks=False,
         )
+        # Ensure files are in TOKENIZER_DIR root for from_pretrained().
+        shutil.copyfile(downloaded_path, os.path.join(TOKENIZER_DIR, filename))
     tok = PreTrainedTokenizerFast.from_pretrained(TOKENIZER_DIR)
     assert_ok(tok.vocab_size > 0, "tokenizer loads", f"vocab={tok.vocab_size}")
     return tok
