@@ -7,7 +7,7 @@ Usage (Colab):
 
 Features:
     - Loads data directly from raokalyaan/codeMath on HuggingFace
-    - torch.compile for ~20-30% throughput boost
+    - Optional torch.compile for throughput boost
     - bf16 mixed precision
     - Gradient accumulation (effective batch = 128 seqs = ~524k tokens)
     - Cosine LR schedule with linear warmup
@@ -49,8 +49,11 @@ GRAD_CLIP        = 1.0
 BETAS            = (0.9, 0.95)
 
 # Batch
-BATCH_SIZE       = 16          # sequences per device step
-GRAD_ACCUM       = 8           # effective batch = 128 seqs = ~524k tokens/step
+BATCH_SIZE       = 4           # sequences per device step (stable on A100 80GB @ 4096)
+GRAD_ACCUM       = 32          # effective batch = 128 seqs = ~524k tokens/step
+
+# Runtime
+USE_COMPILE      = False       # enable after stable run if you want extra throughput
 
 # Schedule
 TOTAL_STEPS      = 26_000      # 3.5B tokens / 524k ≈ 26k steps (~8-10 hrs)
@@ -195,10 +198,13 @@ def train(resume_from: str = None):
     else:
         model = Transformer(config).to("cuda")
 
-    # torch.compile — ~20-30% throughput boost, takes ~60s first time
-    print("Compiling model (takes ~60s first time)...")
-    model = torch.compile(model)
-    print("Compile done.")
+    # torch.compile can increase memory pressure; keep off by default for stability.
+    if USE_COMPILE:
+        print("Compiling model (takes ~60s first time)...")
+        model = torch.compile(model)
+        print("Compile done.")
+    else:
+        print("torch.compile disabled (USE_COMPILE=False).")
 
     # ── Optimiser ──────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
