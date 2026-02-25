@@ -241,13 +241,13 @@ def train(resume_from: str = None):
     optimizer.zero_grad()
     torch.cuda.synchronize()
     t_check = time.time()
-    for _ in range(20):
+    for check_step in range(20):
         ids = next_batch()["input_ids"].to("cuda")
         with autocast("cuda", dtype=torch.bfloat16):
             _, loss = model(ids, ids)
             loss = loss / GRAD_ACCUM
         scaler.scale(loss).backward()
-        if _ % GRAD_ACCUM == GRAD_ACCUM - 1:
+        if check_step % GRAD_ACCUM == GRAD_ACCUM - 1:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             scaler.step(optimizer)
