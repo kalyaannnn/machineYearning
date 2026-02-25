@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Checkpoints & weights — too large for GitHub
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Evaluation results
+results/
+
+# Logs
+*.log
+wandb/
+
+# Local data — never commit raw data
+data/
+*.parquet
+*.jsonl
+*.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Secrets — never commit tokens
+.env
+secrets.py
