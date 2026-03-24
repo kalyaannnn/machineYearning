@@ -1,1 +1,1 @@
-man I really need internship at this point. this is my final straw where I build or rather try to build an entire LM from scratch including pretraining sft and some sort of post training. if this works and still i'm jobless then might as well idk
+man I really need an internship at this point. this is my final straw where I build or rather try to build an entire LM from scratch including pretraining sft and some sort of post training. if this doesn't work and i'm still jobless then might as well idk
