@@ -21,10 +21,8 @@ import sys
 import math
 import time
 import argparse
-import gc
 
 import torch
-import torch.nn as nn
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from datasets import load_dataset
@@ -32,6 +30,18 @@ import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import Transformer, ModelConfig, save_checkpoint, load_checkpoint
+from pipeline_utils import (
+    FIXED_PROMPT_BATTERY,
+    PROMPT_TEMPLATE,
+    append_jsonl,
+    decode_generated_text,
+    load_codemath_tokenizer,
+    make_run_id,
+    prepare_stage_paths,
+    score_prompt_output,
+    set_seed,
+    write_json,
+)
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -66,6 +76,7 @@ CHECKPOINT_DIR   = "./checkpoints/pretrain"
 
 # DataLoader
 NUM_WORKERS      = 4
+SEED             = 42
 
 # ── LR Schedule ────────────────────────────────────────────────────────────
 
@@ -175,15 +186,77 @@ def evaluate(model, val_loader, max_batches: int = 50) -> dict:
     }
 
 
+@torch.no_grad()
+def generate_prompt_samples(
+    model,
+    tokenizer,
+    device: str,
+    stage: str,
+    run_id: str,
+    step: int,
+    samples_jsonl: str,
+    max_new_tokens: int = 96,
+) -> dict:
+    model.eval()
+    total_coherence = 0.0
+    rows = 0
+    for prompt_spec in FIXED_PROMPT_BATTERY:
+        prompt = PROMPT_TEMPLATE.format(instruction=prompt_spec["instruction"])
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        x = torch.tensor([prompt_ids[-SEQ_LEN:]], dtype=torch.long, device=device)
+        out = model.generate(
+            x,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        gen_ids = out[0][x.shape[1]:].tolist()
+        decoded = decode_generated_text(tokenizer, gen_ids)
+        score = score_prompt_output(prompt_spec, decoded["clean"])
+        total_coherence += score["coherence"]
+        rows += 1
+        append_jsonl(samples_jsonl, {
+            "stage": stage,
+            "run_id": run_id,
+            "step": step,
+            "prompt_id": prompt_spec["id"],
+            "instruction": prompt_spec["instruction"],
+            "prompt": prompt,
+            "output_clean": decoded["clean"],
+            "output_raw": decoded["raw"],
+            "scores": score,
+        })
+    return {"coherence_score": total_coherence / max(1, rows)}
+
+
 # ── Training ───────────────────────────────────────────────────────────────
 
-def train(resume_from: str = None):
+def train(resume_from: str = None, run_id: str = None, seed: int = SEED):
+    set_seed(seed)
+    run_id = run_id or make_run_id("pretrain")
+    stage_paths = prepare_stage_paths(stage="pretrain", run_id=run_id)
+    checkpoint_dir = stage_paths.checkpoint_dir
+    tokenizer = load_codemath_tokenizer(REPO)
+    metrics_events = []
+    write_json(
+        stage_paths.metrics_json_run,
+        {
+            "stage": "pretrain",
+            "run_id": run_id,
+            "seed": seed,
+            "repo": REPO,
+            "created_unix": time.time(),
+            "config": {},
+            "events": [],
+        },
+    )
 
     # ── W&B ────────────────────────────────────────────────────────────────
     wandb.init(
         project="llm-270m",
-        name="pretrain-run-1",
+        name=f"pretrain-{run_id}",
         config={
+            "run_id":         run_id,
             "model":          "270M decoder-only transformer",
             "params_M":       268,
             "d_model":        1024,
@@ -206,6 +279,8 @@ def train(resume_from: str = None):
             "total_tokens":   TOTAL_STEPS * BATCH_SIZE * GRAD_ACCUM * SEQ_LEN,
             "gpu":            torch.cuda.get_device_name(0),
             "data_repo":      REPO,
+            "seed":           seed,
+            "prompt_template": PROMPT_TEMPLATE,
         },
         resume="allow",
     )
@@ -221,6 +296,25 @@ def train(resume_from: str = None):
         print(f"  Resuming from step {start_step}")
     else:
         model = Transformer(config).to("cuda")
+
+    write_json(
+        os.path.join(checkpoint_dir, "config_snapshot.json"),
+        {
+            "stage": "pretrain",
+            "run_id": run_id,
+            "seed": seed,
+            "model_config": config.to_dict(),
+            "train_config": {
+                "seq_len": SEQ_LEN,
+                "batch_size": BATCH_SIZE,
+                "grad_accum": GRAD_ACCUM,
+                "total_steps": TOTAL_STEPS,
+                "eval_every": EVAL_EVERY,
+                "checkpoint_every": CHECKPOINT_EVERY,
+                "use_compile": USE_COMPILE,
+            },
+        },
+    )
 
     # torch.compile can increase memory pressure; keep off by default for stability.
     if USE_COMPILE:
@@ -293,7 +387,8 @@ def train(resume_from: str = None):
 
     # ── Main Training Loop ─────────────────────────────────────────────────
     print(f"\nTraining from step {start_step} to {TOTAL_STEPS}")
-    print(f"Checkpoints → {CHECKPOINT_DIR}/\n")
+    print(f"Run ID: {run_id}")
+    print(f"Checkpoints → {checkpoint_dir}/\n")
 
     model.train()
     optimizer.zero_grad()
@@ -333,56 +428,88 @@ def train(resume_from: str = None):
         step_time = time.time() - t0
         tok_per_sec = (BATCH_SIZE * GRAD_ACCUM * SEQ_LEN) / step_time
         tokens_seen = (step + 1) * BATCH_SIZE * GRAD_ACCUM * SEQ_LEN
+        loss_mean = accum_loss / GRAD_ACCUM
 
         # ── Logging ────────────────────────────────────────────────────────
         if step % LOG_EVERY == 0:
             print(
                 f"step {step:6d}/{TOTAL_STEPS} | "
-                f"loss {accum_loss:.4f} | "
+                f"loss_mean {loss_mean:.4f} | "
                 f"lr {lr:.2e} | "
                 f"grad {grad_norm:.3f} | "
                 f"{tok_per_sec/1e3:.1f}k tok/s | "
                 f"{tokens_seen/1e9:.3f}B tokens"
             )
             wandb.log({
-                "train/loss":           accum_loss,
+                "train/loss_mean":      loss_mean,
+                "train/loss_sum":       accum_loss,
                 "train/lr":             lr,
                 "train/grad_norm":      grad_norm.item(),
                 "train/tokens_per_sec": tok_per_sec,
                 "train/tokens_seen":    tokens_seen,
                 "train/step_time_ms":   step_time * 1000,
             }, step=step)
+            metrics_events.append({
+                "kind": "train",
+                "step": step,
+                "loss_mean": loss_mean,
+                "loss_sum": accum_loss,
+                "lr": lr,
+                "grad_norm": grad_norm.item(),
+                "tokens_per_sec": tok_per_sec,
+                "tokens_seen": tokens_seen,
+            })
 
         # ── Val loss ───────────────────────────────────────────────────────
         if step % EVAL_EVERY == 0 and step > 0:
             val_metrics = evaluate(model, val_loader)
+            sample_metrics = generate_prompt_samples(
+                model=model,
+                tokenizer=tokenizer,
+                device="cuda",
+                stage="pretrain",
+                run_id=run_id,
+                step=step,
+                samples_jsonl=stage_paths.samples_jsonl,
+            )
             print(
                 f"  [eval] step {step} | "
                 f"val_loss {val_metrics['loss']:.4f} | "
                 f"val_ppl {val_metrics['perplexity']:.2f} | "
-                f"val_acc {val_metrics['next_token_acc']:.4f}"
+                f"val_acc {val_metrics['next_token_acc']:.4f} | "
+                f"coherence {sample_metrics['coherence_score']:.4f}"
             )
             wandb.log({
                 "val/loss": val_metrics["loss"],
                 "val/perplexity": val_metrics["perplexity"],
                 "val/next_token_acc": val_metrics["next_token_acc"],
+                "val/coherence_score": sample_metrics["coherence_score"],
             }, step=step)
+            metrics_events.append({
+                "kind": "eval",
+                "step": step,
+                "val_loss": val_metrics["loss"],
+                "val_perplexity": val_metrics["perplexity"],
+                "val_next_token_acc": val_metrics["next_token_acc"],
+                "coherence_score": sample_metrics["coherence_score"],
+            })
             model.train()
 
         # ── Checkpoint ─────────────────────────────────────────────────────
         if step % CHECKPOINT_EVERY == 0 and step > 0:
             save_checkpoint(
-                model, optimizer, step, accum_loss,
-                f"{CHECKPOINT_DIR}/step_{step:06d}.pt",
-                extra={"tokens_seen": tokens_seen},
+                model, optimizer, step, loss_mean,
+                f"{checkpoint_dir}/step_{step:06d}.pt",
+                extra={"tokens_seen": tokens_seen, "run_id": run_id, "stage": "pretrain"},
             )
 
         # ── NaN guard ──────────────────────────────────────────────────────
-        if not math.isfinite(accum_loss):
-            print(f"  FATAL: loss is {accum_loss} at step {step}. Stopping.")
+        if not math.isfinite(loss_mean):
+            print(f"  FATAL: loss_mean is {loss_mean} at step {step}. Stopping.")
             save_checkpoint(
-                model, optimizer, step, accum_loss,
-                f"{CHECKPOINT_DIR}/crash_step_{step:06d}.pt",
+                model, optimizer, step, loss_mean,
+                f"{checkpoint_dir}/crash_step_{step:06d}.pt",
+                extra={"run_id": run_id, "stage": "pretrain"},
             )
             wandb.finish(exit_code=1)
             sys.exit(1)
@@ -390,24 +517,69 @@ def train(resume_from: str = None):
     # ── Final checkpoint ───────────────────────────────────────────────────
     print("\nTraining complete.")
     save_checkpoint(
-        model, optimizer, TOTAL_STEPS, accum_loss,
-        f"{CHECKPOINT_DIR}/final.pt",
-        extra={"tokens_seen": TOTAL_STEPS * BATCH_SIZE * GRAD_ACCUM * SEQ_LEN},
+        model, optimizer, TOTAL_STEPS, loss_mean,
+        f"{checkpoint_dir}/final.pt",
+        extra={
+            "tokens_seen": TOTAL_STEPS * BATCH_SIZE * GRAD_ACCUM * SEQ_LEN,
+            "run_id": run_id,
+            "stage": "pretrain",
+        },
     )
 
     # final val loss
     val_metrics = evaluate(model, val_loader, max_batches=200)
+    sample_metrics = generate_prompt_samples(
+        model=model,
+        tokenizer=tokenizer,
+        device="cuda",
+        stage="pretrain",
+        run_id=run_id,
+        step=TOTAL_STEPS,
+        samples_jsonl=stage_paths.samples_jsonl,
+    )
     print(
         f"Final val | "
         f"loss {val_metrics['loss']:.4f} | "
         f"ppl {val_metrics['perplexity']:.2f} | "
-        f"acc {val_metrics['next_token_acc']:.4f}"
+        f"acc {val_metrics['next_token_acc']:.4f} | "
+        f"coherence {sample_metrics['coherence_score']:.4f}"
     )
     wandb.log({
         "val/loss": val_metrics["loss"],
         "val/perplexity": val_metrics["perplexity"],
         "val/next_token_acc": val_metrics["next_token_acc"],
+        "val/coherence_score": sample_metrics["coherence_score"],
     }, step=TOTAL_STEPS)
+    metrics_events.append({
+        "kind": "final_eval",
+        "step": TOTAL_STEPS,
+        "val_loss": val_metrics["loss"],
+        "val_perplexity": val_metrics["perplexity"],
+        "val_next_token_acc": val_metrics["next_token_acc"],
+        "coherence_score": sample_metrics["coherence_score"],
+    })
+    metrics_payload = {
+        "stage": "pretrain",
+        "run_id": run_id,
+        "seed": seed,
+        "repo": REPO,
+        "created_unix": time.time(),
+        "config": {
+            "seq_len": SEQ_LEN,
+            "batch_size": BATCH_SIZE,
+            "grad_accum": GRAD_ACCUM,
+            "total_steps": TOTAL_STEPS,
+        },
+        "events": metrics_events,
+        "final": {
+            "val_loss": val_metrics["loss"],
+            "val_perplexity": val_metrics["perplexity"],
+            "val_next_token_acc": val_metrics["next_token_acc"],
+            "coherence_score": sample_metrics["coherence_score"],
+        },
+    }
+    write_json(stage_paths.metrics_json, metrics_payload)
+    write_json(stage_paths.metrics_json_run, metrics_payload)
     wandb.finish()
 
     return model
@@ -423,10 +595,12 @@ if __name__ == "__main__":
         default=None,
         help="Path to checkpoint to resume from, e.g. checkpoints/pretrain/step_005000.pt"
     )
+    parser.add_argument("--run-id", type=str, default=None, help="Optional run ID for artifact traceability.")
+    parser.add_argument("--seed", type=int, default=SEED, help="Global random seed.")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA required for training"
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    train(resume_from=args.resume)
+    train(resume_from=args.resume, run_id=args.run_id, seed=args.seed)
