@@ -26,7 +26,6 @@ import torch
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import Transformer, ModelConfig, save_checkpoint, load_checkpoint
@@ -42,6 +41,7 @@ from pipeline_utils import (
     set_seed,
     write_json,
 )
+from wandb_utils import get_wandb
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -77,6 +77,7 @@ CHECKPOINT_DIR   = "./checkpoints/pretrain"
 # DataLoader
 NUM_WORKERS      = 4
 SEED             = 42
+wandb = get_wandb()
 
 # ── LR Schedule ────────────────────────────────────────────────────────────
 

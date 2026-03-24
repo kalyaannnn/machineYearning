@@ -16,7 +16,6 @@ import torch
 from datasets import load_dataset
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import load_checkpoint, save_checkpoint
@@ -32,6 +31,7 @@ from pipeline_utils import (
     set_seed,
     write_json,
 )
+from wandb_utils import get_wandb
 
 
 REPO = "raokalyaan/codeMath"
@@ -54,6 +54,7 @@ NUM_WORKERS = 4
 VAL_MAX_BATCHES = 100
 VAL_SPLIT = 0.02
 USE_COMPILE = False
+wandb = get_wandb()
 
 
 def get_lr(step: int) -> float:
