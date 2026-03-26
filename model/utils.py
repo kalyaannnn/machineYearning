@@ -75,10 +75,19 @@ def load_checkpoint(
     if device is None:
         device = get_device()
 
-    ckpt   = torch.load(path, map_location=device)
+    ckpt   = torch.load(path, map_location=device, weights_only=False)
     config = ModelConfig.from_dict(ckpt["config"])
     model  = Transformer(config).to(device)
-    model.load_state_dict(ckpt["model"])
+
+    state = ckpt["model"]
+    # Migrate checkpoints saved before the RoPE refactor (freqs_cis → rope_cos/rope_sin)
+    if "freqs_cis" in state and "rope_cos" not in state:
+        import torch as _torch
+        freqs_cis = state.pop("freqs_cis")          # complex [seq_len, head_dim//2]
+        state["rope_cos"] = freqs_cis.real.float()
+        state["rope_sin"] = freqs_cis.imag.float()
+
+    model.load_state_dict(state)
     print(f"[ckpt] Loaded <- {path}  (step={ckpt['step']}, loss={ckpt['loss']:.4f})")
     return model, ckpt
 
