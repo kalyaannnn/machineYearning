@@ -92,16 +92,16 @@ def evaluate_pretrain_val(model, batch_size: int = 4) -> dict:
 
 @torch.no_grad()
 def evaluate_code_subset(model, batch_size: int = 4) -> dict:
+    # Use pretrain_val (StarCoder shard) — never seen by SFT, measures code
+    # next-token prediction without any overlap with SFT training data.
     ds = load_dataset(
         REPO,
-        data_files={"train": "sft_train/*.parquet"},
-        split="train[:2000]",
+        data_files={"val": "pretrain_val/*.parquet"},
+        split="val[:2000]",
     )
-    splits = ds.train_test_split(test_size=0.2, seed=42, shuffle=True)
-    val_ds = splits["test"]
-    val_ds.set_format("torch", columns=["input_ids", "labels"])
+    ds.set_format("torch", columns=["input_ids"])
     loader = torch.utils.data.DataLoader(
-        val_ds,
+        ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=2,
@@ -116,12 +116,12 @@ def evaluate_code_subset(model, batch_size: int = 4) -> dict:
         if n_batches >= CODE_SUBSET_BATCHES:
             break
         input_ids = batch["input_ids"].to("cuda")
-        labels = batch["labels"].to("cuda")
+        targets = make_lm_targets(input_ids)
         with autocast("cuda", dtype=torch.bfloat16):
-            logits, loss = model(input_ids, labels)
+            logits, loss = model(input_ids, targets)
         preds = logits.argmax(dim=-1)
-        valid = labels != -100
-        total_correct += (preds[valid] == labels[valid]).sum().item()
+        valid = targets != -100
+        total_correct += (preds[valid] == targets[valid]).sum().item()
         total_count += valid.sum().item()
         total_loss += loss.item()
         n_batches += 1

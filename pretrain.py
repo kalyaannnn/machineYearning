@@ -23,7 +23,7 @@ import time
 import argparse
 
 import torch
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 
@@ -63,7 +63,7 @@ BATCH_SIZE       = 4           # sequences per device step (stable on A100 80GB 
 GRAD_ACCUM       = 32          # effective batch = 128 seqs = ~524k tokens/step
 
 # Runtime
-USE_COMPILE      = False       # enable after stable run if you want extra throughput
+USE_COMPILE      = True        # bf16 + compile gives ~30-50% throughput boost on A100
 
 # Schedule
 TOTAL_STEPS      = 26_000      # With current batch settings this is ~13.6B tokens.
@@ -234,7 +234,18 @@ def generate_prompt_samples(
 
 def train(resume_from: str = None, run_id: str = None, seed: int = SEED):
     set_seed(seed)
-    run_id = run_id or make_run_id("pretrain")
+
+    # When resuming, restore run_id from checkpoint so W&B continues the same run
+    if resume_from and run_id is None:
+        try:
+            ckpt_peek = torch.load(resume_from, map_location="cpu", weights_only=False)
+            run_id = ckpt_peek.get("run_id") or make_run_id("pretrain")
+            del ckpt_peek
+        except Exception:
+            run_id = make_run_id("pretrain")
+    else:
+        run_id = run_id or make_run_id("pretrain")
+
     stage_paths = prepare_stage_paths(stage="pretrain", run_id=run_id)
     checkpoint_dir = stage_paths.checkpoint_dir
     tokenizer = load_codemath_tokenizer(REPO)
@@ -339,8 +350,6 @@ def train(resume_from: str = None, run_id: str = None, seed: int = SEED):
         optimizer.load_state_dict(ckpt["optimizer"])
         print("  Optimizer state restored.")
 
-    scaler = GradScaler()
-
     # ── Data ───────────────────────────────────────────────────────────────
     train_loader, val_loader = build_loaders()
     train_iter = iter(train_loader)
@@ -368,12 +377,10 @@ def train(resume_from: str = None, run_id: str = None, seed: int = SEED):
             with autocast("cuda", dtype=torch.bfloat16):
                 _, loss = model(ids, targets)
                 loss = loss / GRAD_ACCUM
-            scaler.scale(loss).backward()
+            loss.backward()
 
-        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         optimizer.zero_grad()
     torch.cuda.synchronize()
     check_elapsed = time.time() - t_check
@@ -413,16 +420,11 @@ def train(resume_from: str = None, run_id: str = None, seed: int = SEED):
                 raw_loss = loss.detach().item()
                 loss = loss / GRAD_ACCUM
 
-            scaler.scale(loss).backward()
+            loss.backward()
             accum_loss += raw_loss
 
-        # unscale → clip → step → zero
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), GRAD_CLIP
-        )
-        scaler.step(optimizer)
-        scaler.update()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        optimizer.step()
         optimizer.zero_grad()
 
         torch.cuda.synchronize()

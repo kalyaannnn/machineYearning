@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass
+from typing import Optional
 
 import torch
 from datasets import load_dataset
@@ -202,7 +203,7 @@ def train_sft(
     run_id: str = None,
     seed: int = SEED,
     resume_from: str = None,
-    cfg: SFTConfig | None = None,
+    cfg: Optional[SFTConfig] = None,
 ):
     assert torch.cuda.is_available(), "CUDA required for SFT"
     set_seed(seed)
