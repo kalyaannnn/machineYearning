@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -84,16 +85,29 @@ def get_lr(step: int, cfg: SFTConfig) -> float:
     return cfg.min_lr + 0.5 * (cfg.sft_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
-def build_loaders(seed: int, cfg: SFTConfig):
-    print("Loading SFT data from HuggingFace...")
-    ds = load_dataset(
-        REPO,
-        data_files={"train": "sft_train/*.parquet"},
-        split="train",
-    )
-    splits = ds.train_test_split(test_size=cfg.val_split, seed=seed, shuffle=True)
-    train_ds = splits["train"]
-    val_ds = splits["test"]
+def build_loaders(seed: int, cfg: SFTConfig, local_data_dir: Optional[str] = None):
+    if local_data_dir:
+        print(f"Loading SFT data from local dir: {local_data_dir}")
+        train_ds = load_dataset(
+            "parquet",
+            data_files={"train": str(Path(local_data_dir) / "sft_train.parquet")},
+            split="train",
+        )
+        val_ds = load_dataset(
+            "parquet",
+            data_files={"val": str(Path(local_data_dir) / "sft_val.parquet")},
+            split="val",
+        )
+    else:
+        print("Loading SFT data from HuggingFace...")
+        ds = load_dataset(
+            REPO,
+            data_files={"train": "sft_train/*.parquet"},
+            split="train",
+        )
+        splits = ds.train_test_split(test_size=cfg.val_split, seed=seed, shuffle=True)
+        train_ds = splits["train"]
+        val_ds   = splits["test"]
 
     train_ds.set_format("torch", columns=["input_ids", "labels"])
     val_ds.set_format("torch", columns=["input_ids", "labels"])
@@ -123,7 +137,8 @@ def build_loaders(seed: int, cfg: SFTConfig):
         "val_split": cfg.val_split,
         "train_rows": len(train_ds),
         "val_rows": len(val_ds),
-        "note": "This is an in-domain random row split. Use eval_pipeline.py for promotion decisions.",
+        "local_data_dir": local_data_dir,
+        "note": "Use eval_pipeline.py for promotion decisions.",
     }
     return train_loader, val_loader, split_meta
 
@@ -204,6 +219,7 @@ def train_sft(
     seed: int = SEED,
     resume_from: str = None,
     cfg: Optional[SFTConfig] = None,
+    local_data_dir: Optional[str] = None,
 ):
     assert torch.cuda.is_available(), "CUDA required for SFT"
     set_seed(seed)
@@ -236,7 +252,7 @@ def train_sft(
     )
     scaler = GradScaler()
 
-    train_loader, val_loader, split_meta = build_loaders(seed=seed, cfg=cfg)
+    train_loader, val_loader, split_meta = build_loaders(seed=seed, cfg=cfg, local_data_dir=local_data_dir)
     train_iter = iter(train_loader)
 
     def next_batch():
@@ -503,6 +519,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay.")
     parser.add_argument("--grad-clip", type=float, default=GRAD_CLIP, help="Gradient clip norm.")
     parser.add_argument("--use-compile", action="store_true", help="Enable torch.compile for SFT.")
+    parser.add_argument("--local-data-dir", type=str, default=None,
+                        help="Path to dir with sft_train.parquet + sft_val.parquet from prep_sft_data.py")
     args = parser.parse_args()
 
     cfg = SFTConfig(
@@ -527,4 +545,5 @@ if __name__ == "__main__":
         seed=args.seed,
         resume_from=args.resume,
         cfg=cfg,
+        local_data_dir=args.local_data_dir,
     )
