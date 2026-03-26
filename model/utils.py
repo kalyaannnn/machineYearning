@@ -80,10 +80,14 @@ def load_checkpoint(
     model  = Transformer(config).to(device)
 
     state = ckpt["model"]
+
+    # Strip _orig_mod. prefix added by torch.compile when saving state_dict
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
+
     # Migrate checkpoints saved before the RoPE refactor (freqs_cis → rope_cos/rope_sin)
     if "freqs_cis" in state and "rope_cos" not in state:
-        import torch as _torch
-        freqs_cis = state.pop("freqs_cis")          # complex [seq_len, head_dim//2]
+        freqs_cis = state.pop("freqs_cis")
         state["rope_cos"] = freqs_cis.real.float()
         state["rope_sin"] = freqs_cis.imag.float()
 
