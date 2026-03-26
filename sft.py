@@ -11,6 +11,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import asdict, dataclass
 
 import torch
 from datasets import load_dataset
@@ -57,21 +58,39 @@ USE_COMPILE = False
 wandb = get_wandb()
 
 
-def get_lr(step: int) -> float:
-    if step < WARMUP_STEPS:
-        return SFT_LR * (step / WARMUP_STEPS)
-    progress = (step - WARMUP_STEPS) / max(1, TOTAL_STEPS - WARMUP_STEPS)
-    return MIN_LR + 0.5 * (SFT_LR - MIN_LR) * (1 + math.cos(math.pi * progress))
+@dataclass
+class SFTConfig:
+    sft_lr: float = SFT_LR
+    min_lr: float = MIN_LR
+    warmup_steps: int = WARMUP_STEPS
+    weight_decay: float = WEIGHT_DECAY
+    grad_clip: float = GRAD_CLIP
+    batch_size: int = BATCH_SIZE
+    grad_accum: int = GRAD_ACCUM
+    total_steps: int = TOTAL_STEPS
+    eval_every: int = EVAL_EVERY
+    checkpoint_every: int = CHECKPOINT_EVERY
+    num_workers: int = NUM_WORKERS
+    val_max_batches: int = VAL_MAX_BATCHES
+    val_split: float = VAL_SPLIT
+    use_compile: bool = USE_COMPILE
 
 
-def build_loaders(seed: int):
+def get_lr(step: int, cfg: SFTConfig) -> float:
+    if step < cfg.warmup_steps:
+        return cfg.sft_lr * (step / cfg.warmup_steps)
+    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
+    return cfg.min_lr + 0.5 * (cfg.sft_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def build_loaders(seed: int, cfg: SFTConfig):
     print("Loading SFT data from HuggingFace...")
     ds = load_dataset(
         REPO,
         data_files={"train": "sft_train/*.parquet"},
         split="train",
     )
-    splits = ds.train_test_split(test_size=VAL_SPLIT, seed=seed, shuffle=True)
+    splits = ds.train_test_split(test_size=cfg.val_split, seed=seed, shuffle=True)
     train_ds = splits["train"]
     val_ds = splits["test"]
 
@@ -82,27 +101,34 @@ def build_loaders(seed: int):
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=BATCH_SIZE,
+        batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=NUM_WORKERS,
+        num_workers=cfg.num_workers,
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=BATCH_SIZE,
+        batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=NUM_WORKERS,
+        num_workers=cfg.num_workers,
         pin_memory=True,
         drop_last=False,
         persistent_workers=True,
     )
-    return train_loader, val_loader
+    split_meta = {
+        "seed": seed,
+        "val_split": cfg.val_split,
+        "train_rows": len(train_ds),
+        "val_rows": len(val_ds),
+        "note": "This is an in-domain random row split. Use eval_pipeline.py for promotion decisions.",
+    }
+    return train_loader, val_loader, split_meta
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, max_batches: int = VAL_MAX_BATCHES) -> dict:
+def evaluate(model, val_loader, max_batches: int) -> dict:
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -171,9 +197,16 @@ def generate_prompt_samples(
     return {"coherence_score": total_coherence / max(1, rows)}
 
 
-def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_from: str = None):
+def train_sft(
+    pretrain_ckpt: str,
+    run_id: str = None,
+    seed: int = SEED,
+    resume_from: str = None,
+    cfg: SFTConfig | None = None,
+):
     assert torch.cuda.is_available(), "CUDA required for SFT"
     set_seed(seed)
+    cfg = cfg or SFTConfig()
 
     run_id = run_id or make_run_id("sft")
     paths = prepare_stage_paths(stage="sft", run_id=run_id)
@@ -187,22 +220,22 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
         model, _ = load_checkpoint(pretrain_ckpt, device="cuda")
         start_step = 0
 
-    if USE_COMPILE:
+    if cfg.use_compile:
         print("Compiling model (SFT)...")
         model = torch.compile(model)
         print("Compile done.")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=SFT_LR,
+        lr=cfg.sft_lr,
         betas=BETAS,
         eps=1e-8,
-        weight_decay=WEIGHT_DECAY,
+        weight_decay=cfg.weight_decay,
         fused=True,
     )
     scaler = GradScaler()
 
-    train_loader, val_loader = build_loaders(seed=seed)
+    train_loader, val_loader, split_meta = build_loaders(seed=seed, cfg=cfg)
     train_iter = iter(train_loader)
 
     def next_batch():
@@ -223,13 +256,15 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
             "repo": REPO,
             "pretrain_ckpt": pretrain_ckpt,
             "seq_len": SEQ_LEN,
-            "batch_size": BATCH_SIZE,
-            "grad_accum": GRAD_ACCUM,
-            "total_steps": TOTAL_STEPS,
-            "eval_every": EVAL_EVERY,
-            "checkpoint_every": CHECKPOINT_EVERY,
-            "val_split": VAL_SPLIT,
+            "batch_size": cfg.batch_size,
+            "grad_accum": cfg.grad_accum,
+            "total_steps": cfg.total_steps,
+            "eval_every": cfg.eval_every,
+            "checkpoint_every": cfg.checkpoint_every,
+            "val_split": cfg.val_split,
             "prompt_template": PROMPT_TEMPLATE,
+            "validation_note": split_meta["note"],
+            **asdict(cfg),
         },
         resume="allow",
     )
@@ -242,23 +277,14 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
             "seed": seed,
             "pretrain_ckpt": pretrain_ckpt,
             "resume_from": resume_from,
-            "train_config": {
-                "sft_lr": SFT_LR,
-                "min_lr": MIN_LR,
-                "warmup_steps": WARMUP_STEPS,
-                "weight_decay": WEIGHT_DECAY,
-                "grad_clip": GRAD_CLIP,
-                "batch_size": BATCH_SIZE,
-                "grad_accum": GRAD_ACCUM,
-                "total_steps": TOTAL_STEPS,
-                "eval_every": EVAL_EVERY,
-                "checkpoint_every": CHECKPOINT_EVERY,
-                "val_split": VAL_SPLIT,
-            },
+            "train_config": asdict(cfg),
+            "split_metadata": split_meta,
         },
     )
+    write_json(os.path.join(paths.checkpoint_dir, "split_metadata.json"), split_meta)
 
-    print(f"\nSFT from step {start_step} to {TOTAL_STEPS}")
+    print("\nSFT validation is in-domain only; use eval_pipeline.py for promotion decisions.")
+    print(f"SFT from step {start_step} to {cfg.total_steps}")
     print(f"Run ID: {run_id}")
     print(f"Checkpoints -> {paths.checkpoint_dir}\n")
 
@@ -267,38 +293,38 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
 
     model.train()
     optimizer.zero_grad()
-    for step in range(start_step, TOTAL_STEPS):
+    for step in range(start_step, cfg.total_steps):
         t0 = time.time()
-        lr = get_lr(step)
+        lr = get_lr(step, cfg)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
         accum_loss = 0.0
-        for _ in range(GRAD_ACCUM):
+        for _ in range(cfg.grad_accum):
             batch = next_batch()
             input_ids = batch["input_ids"].to("cuda")
             labels = batch["labels"].to("cuda")
             with autocast("cuda", dtype=torch.bfloat16):
                 _, loss = model(input_ids, labels)
                 raw_loss = loss.detach().item()
-                loss = loss / GRAD_ACCUM
+                loss = loss / cfg.grad_accum
             scaler.scale(loss).backward()
             accum_loss += raw_loss
 
         scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
 
         torch.cuda.synchronize()
         step_time = time.time() - t0
-        loss_mean = accum_loss / GRAD_ACCUM
-        tok_per_sec = (BATCH_SIZE * GRAD_ACCUM * SEQ_LEN) / step_time
+        loss_mean = accum_loss / cfg.grad_accum
+        tok_per_sec = (cfg.batch_size * cfg.grad_accum * SEQ_LEN) / step_time
 
         if step % 10 == 0:
             print(
-                f"step {step:6d}/{TOTAL_STEPS} | "
+                f"step {step:6d}/{cfg.total_steps} | "
                 f"loss_mean {loss_mean:.4f} | "
                 f"lr {lr:.2e} | "
                 f"grad {grad_norm:.3f} | "
@@ -322,8 +348,8 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
                 "tokens_per_sec": tok_per_sec,
             })
 
-        if step % EVAL_EVERY == 0 and step > 0:
-            val_metrics = evaluate(model, val_loader)
+        if step % cfg.eval_every == 0 and step > 0:
+            val_metrics = evaluate(model, val_loader, max_batches=cfg.val_max_batches)
             sample_metrics = generate_prompt_samples(
                 model=model,
                 tokenizer=tokenizer,
@@ -341,9 +367,9 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
                 f"coherence {sample_metrics['coherence_score']:.4f}"
             )
             wandb.log({
-                "val/loss": val_metrics["loss"],
-                "val/perplexity": val_metrics["perplexity"],
-                "val/next_token_acc": val_metrics["next_token_acc"],
+                "val/in_domain_loss": val_metrics["loss"],
+                "val/in_domain_perplexity": val_metrics["perplexity"],
+                "val/in_domain_next_token_acc": val_metrics["next_token_acc"],
                 "val/coherence_score": sample_metrics["coherence_score"],
             }, step=step)
             metrics_events.append({
@@ -368,7 +394,7 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
                 )
                 print(f"  [best] updated -> {best_ckpt_path}")
 
-        if step % CHECKPOINT_EVERY == 0 and step > 0:
+        if step % cfg.checkpoint_every == 0 and step > 0:
             save_checkpoint(
                 model,
                 optimizer,
@@ -394,7 +420,7 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
     save_checkpoint(
         model,
         optimizer,
-        TOTAL_STEPS,
+        cfg.total_steps,
         loss_mean,
         f"{paths.checkpoint_dir}/last.pt",
         extra={"run_id": run_id, "stage": "sft"},
@@ -406,15 +432,15 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
         device="cuda",
         stage="sft",
         run_id=run_id,
-        step=TOTAL_STEPS,
+        step=cfg.total_steps,
         samples_jsonl=paths.samples_jsonl,
     )
     wandb.log({
-        "val/loss": final_val["loss"],
-        "val/perplexity": final_val["perplexity"],
-        "val/next_token_acc": final_val["next_token_acc"],
+        "val/in_domain_loss": final_val["loss"],
+        "val/in_domain_perplexity": final_val["perplexity"],
+        "val/in_domain_next_token_acc": final_val["next_token_acc"],
         "val/coherence_score": final_samples["coherence_score"],
-    }, step=TOTAL_STEPS)
+    }, step=cfg.total_steps)
 
     best_metrics = None
     if os.path.exists(best_ckpt_path):
@@ -427,23 +453,25 @@ def train_sft(pretrain_ckpt: str, run_id: str = None, seed: int = SEED, resume_f
             f"acc {best_metrics['next_token_acc']:.4f}"
         )
         wandb.log({
-            "best_val/loss": best_metrics["loss"],
-            "best_val/perplexity": best_metrics["perplexity"],
-            "best_val/next_token_acc": best_metrics["next_token_acc"],
-        }, step=TOTAL_STEPS)
+            "best_val/in_domain_loss": best_metrics["loss"],
+            "best_val/in_domain_perplexity": best_metrics["perplexity"],
+            "best_val/in_domain_next_token_acc": best_metrics["next_token_acc"],
+        }, step=cfg.total_steps)
 
     metrics_payload = {
         "stage": "sft",
         "run_id": run_id,
         "seed": seed,
         "pretrain_ckpt": pretrain_ckpt,
+        "config": asdict(cfg),
+        "split_metadata": split_meta,
         "best_checkpoint": best_ckpt_path if os.path.exists(best_ckpt_path) else None,
         "last_checkpoint": f"{paths.checkpoint_dir}/last.pt",
         "events": metrics_events,
         "final": {
-            "val_loss": final_val["loss"],
-            "val_perplexity": final_val["perplexity"],
-            "val_next_token_acc": final_val["next_token_acc"],
+            "val_in_domain_loss": final_val["loss"],
+            "val_in_domain_perplexity": final_val["perplexity"],
+            "val_in_domain_next_token_acc": final_val["next_token_acc"],
             "coherence_score": final_samples["coherence_score"],
             "best_checkpoint_eval": best_metrics,
         },
@@ -460,11 +488,42 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None, help="Optional SFT checkpoint to resume from.")
     parser.add_argument("--run-id", type=str, default=None, help="Optional run ID.")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed.")
+    parser.add_argument("--lr", type=float, default=SFT_LR, help="SFT peak learning rate.")
+    parser.add_argument("--min-lr", type=float, default=MIN_LR, help="Minimum learning rate after cosine decay.")
+    parser.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS, help="Warmup steps.")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size.")
+    parser.add_argument("--grad-accum", type=int, default=GRAD_ACCUM, help="Gradient accumulation steps.")
+    parser.add_argument("--total-steps", type=int, default=TOTAL_STEPS, help="Total SFT steps.")
+    parser.add_argument("--eval-every", type=int, default=EVAL_EVERY, help="Eval interval in steps.")
+    parser.add_argument("--checkpoint-every", type=int, default=CHECKPOINT_EVERY, help="Checkpoint interval in steps.")
+    parser.add_argument("--val-split", type=float, default=VAL_SPLIT, help="Validation split fraction.")
+    parser.add_argument("--val-max-batches", type=int, default=VAL_MAX_BATCHES, help="Max val batches per eval.")
+    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS, help="Dataloader workers.")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay.")
+    parser.add_argument("--grad-clip", type=float, default=GRAD_CLIP, help="Gradient clip norm.")
+    parser.add_argument("--use-compile", action="store_true", help="Enable torch.compile for SFT.")
     args = parser.parse_args()
 
+    cfg = SFTConfig(
+        sft_lr=args.lr,
+        min_lr=args.min_lr,
+        warmup_steps=args.warmup_steps,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        batch_size=args.batch_size,
+        grad_accum=args.grad_accum,
+        total_steps=args.total_steps,
+        eval_every=args.eval_every,
+        checkpoint_every=args.checkpoint_every,
+        num_workers=args.num_workers,
+        val_max_batches=args.val_max_batches,
+        val_split=args.val_split,
+        use_compile=args.use_compile,
+    )
     train_sft(
         pretrain_ckpt=args.pretrain_ckpt,
         run_id=args.run_id,
         seed=args.seed,
         resume_from=args.resume,
+        cfg=cfg,
     )
