@@ -29,12 +29,13 @@ class Transformer(nn.Module):
         if config.tie_embeddings:
             self.head.weight = self.embed.weight
 
-        freqs_cis = precompute_rope_freqs(
+        cos, sin = precompute_rope_freqs(
             head_dim=config.head_dim,
             seq_len=config.seq_len,
             theta=config.rope_theta,
         )
-        self.register_buffer("freqs_cis", freqs_cis)
+        self.register_buffer("rope_cos", cos)
+        self.register_buffer("rope_sin", sin)
 
         self._init_weights()
 
@@ -92,8 +93,8 @@ class Transformer(nn.Module):
         # embed tokens
         x = self.embed(input_ids)              # [B, T, d_model]
 
-        # get precomputed RoPE freqs for this sequence length
-        freqs_cis = self.freqs_cis[:T]         # [T, head_dim // 2]
+        # get precomputed RoPE cos/sin for this sequence length
+        freqs_cis = (self.rope_cos[:T], self.rope_sin[:T])
 
         # forward through all blocks
         for layer in self.layers:
