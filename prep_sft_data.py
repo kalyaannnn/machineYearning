@@ -178,8 +178,8 @@ def build(args):
     # train / val split
     n_val   = max(1, int(len(packed_ids) * VAL_SPLIT))
     n_train = len(packed_ids) - n_val
-    train_ids,    val_ids    = packed_ids[:n_train],    packed_ids[n_val:]
-    train_labels, val_labels = packed_labels[:n_train], packed_labels[n_val:]
+    train_ids,    val_ids    = packed_ids[:n_train],    packed_ids[n_train:]
+    train_labels, val_labels = packed_labels[:n_train], packed_labels[n_train:]
 
     print(f"\nSplit: train={n_train:,}  val={n_val:,}")
 
